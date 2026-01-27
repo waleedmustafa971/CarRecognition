@@ -1,0 +1,61 @@
+{
+  "model_hierarchy": [
+    {
+      "tier": "specialist",
+      "priority": 1,
+      "models": [
+        {
+          "name": "tesla",
+          "path": "models/tesla/weights/best.pt",
+          "brands": ["Tesla"],
+          "min_confidence": 0.65,
+          "only_for_brands": ["Tesla"]
+        },
+        {
+          "name": "kia",
+          "path": "models/kia/weights/best.pt",
+          "brands": ["Kia"],
+          "min_confidence": 0.65,
+          "only_for_brands": ["Kia"]
+        },
+        {
+          "name": "mclaren",
+          "path": "models/mclaren/weights/best.pt",
+          "brands": ["McLaren"],
+          "min_confidence": 0.70,
+          "only_for_brands": ["McLaren"]
+        }
+      ]
+    },
+    {
+      "tier": "general",
+      "priority": 2,
+      "models": [
+        {
+          "name": "car_logo",
+          "path": "models/car_logo/weights/best.pt",
+          "brands": ["*"],
+          "min_confidence": 0.35,
+          "is_primary": true
+        },
+        {
+          "name": "car_make",
+          "path": "models/car_make/weights/best.pt",
+          "brands": ["*"],
+          "min_confidence": 0.40,
+          "is_backup": true
+        },
+        {
+          "name": "stanford",
+          "path": "models/stanford_cars/weights/best.pt",
+          "brands": ["*"],
+          "min_confidence": 0.40,
+          "is_backup": true
+        }
+      ]
+    }
+  ],
+  "voting_strategy": "weighted_consensus",
+  "consensus_threshold": 0.6,
+  "fallback_strategy": "highest_confidence"
+}

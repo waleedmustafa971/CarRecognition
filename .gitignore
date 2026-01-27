@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# SVN
+.svn/
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+temp_*
+*.tmp
+
+# Model weights (too large for git)
+*.pt
+*.pth
+*.onnx
+*.engine
+models/
+weights/
+
+# Datasets (too large for git)
+datasets/
+runs/
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment variables
+.env
+.env.local
+
+# Test images
+test_images/
+temp/
+
+# NSSM executable
+nssm.exe
+
+# Batch scripts (Windows-specific)
+*.bat
+
+# PDF reports
+*.pdf

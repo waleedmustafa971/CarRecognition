@@ -1,0 +1,45 @@
+net start CarDetectionAPI
+
+net stop CarDetectionAPI
+
+net stop CarDetectionAPI && timeout /t 3 /nobreak && net start CarDetectionAPI
+
+sc query CarDetectionAPI
+
+curl http://localhost:8080/health
+
+cd C:\Users\Administrator\Desktop\car_recognition\logs
+
+dir logs
+
+type logs\service_stdout.log
+
+type logs\service_stderr.log
+
+powershell Get-Content logs\service_stdout.log -Tail 50
+
+powershell Get-Content logs\service_stderr.log -Tail 50
+
+powershell Get-Content logs\api_20251124.log -Tail 50
+
+start explorer logs
+
+nssm edit CarDetectionAPI
+
+nssm remove CarDetectionAPI confirm
+
+
+Quick reference:
+
+Line 1: Start service
+Line 3: Stop service
+Line 5: Restart service
+Line 7: Check status
+Line 9: Test API health
+Line 11: Go to logs folder
+Line 13: List log files
+Line 15-19: View full logs
+Line 21-25: View last 50 lines of logs
+Line 27: Open logs folder in Explorer
+Line 29: Edit service settings (GUI)
+Line 31: Uninstall service

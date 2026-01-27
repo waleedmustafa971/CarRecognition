@@ -1,0 +1,585 @@
+import ssl
+import urllib3
+import certifi
+import os
+import sys
+import cv2
+import json
+import numpy as np
+import tempfile
+import requests
+from ultralytics import YOLO
+import easyocr
+from pathlib import Path
+import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import gc
+import threading
+from contextlib import contextmanager
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(funcName)s] %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ssl._create_default_https_context = ssl._create_unverified_context
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+os.environ['SSL_CERT_FILE'] = certifi.where()
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Thread-local storage for models
+_thread_local = threading.local()
+
+MODEL_PATHS = {
+    'logo': ['models/car_logo/weights/best.pt', 'car_logo.pt', 'models/car_logo.pt'],
+    'make': ['models/car_make/weights/best.pt', 'car_make.pt', 'models/car_make.pt'],
+    'stanford': ['models/stanford_cars/weights/best.pt', 'stanford_cars.pt', 'models/stanford_cars.pt']
+}
+
+def get_local_models():
+    """Get or initialize local models for this thread"""
+    if not hasattr(_thread_local, 'local_models'):
+        _thread_local.local_models = {}
+        logger.info("Initializing models for thread...")
+        
+        for model_name, possible_paths in MODEL_PATHS.items():
+            for path in possible_paths:
+                if os.path.exists(path):
+                    try:
+                        _thread_local.local_models[model_name] = YOLO(path)
+                        logger.info(f"Loaded local {model_name} model from {path}")
+                        break
+                    except Exception as e:
+                        logger.error(f"Could not load {path}: {e}")
+                        continue
+        
+        if not _thread_local.local_models:
+            logger.info("No local models found - using API only")
+    
+    return _thread_local.local_models
+
+def get_yolo_model():
+    """Get or initialize YOLO model for this thread"""
+    if not hasattr(_thread_local, 'yolo_model'):
+        logger.info("Initializing YOLO model for thread...")
+        _thread_local.yolo_model = YOLO('yolov8n.pt')
+        logger.info("YOLO model loaded successfully")
+    return _thread_local.yolo_model
+
+def get_ocr_reader():
+    """Get or initialize OCR reader for this thread"""
+    if not hasattr(_thread_local, 'ocr_reader'):
+        logger.info("Initializing EasyOCR reader for thread...")
+        _thread_local.ocr_reader = easyocr.Reader(['en'], gpu=False)
+        logger.info("EasyOCR reader loaded successfully")
+    return _thread_local.ocr_reader
+
+@contextmanager
+def managed_cv2_image(path):
+    """Context manager for CV2 images to ensure cleanup"""
+    image = None
+    try:
+        image = cv2.imread(path)
+        yield image
+    finally:
+        if image is not None:
+            del image
+        gc.collect()
+
+def create_session_with_retries():
+    session = requests.Session()
+    retry = Retry(
+        total=2,
+        backoff_factor=0.3,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def clean_plate_text(text):
+    logger.debug(f"Cleaning plate text: '{text}'")
+    result = ""
+    for char in text.upper():
+        if char.isalnum():
+            result += char
+        elif char in ['I', 'l', '|']:
+            result += '1'
+    logger.debug(f"Cleaned plate text: '{result}'")
+    return result
+
+def exclude_plate_from_vehicle(vehicle_crop, plate_box_relative=None):
+    try:
+        if plate_box_relative is None:
+            return vehicle_crop
+        
+        masked_crop = vehicle_crop.copy()
+        
+        plate_x1 = max(0, plate_box_relative['xmin'])
+        plate_y1 = max(0, plate_box_relative['ymin'])
+        plate_x2 = min(vehicle_crop.shape[1], plate_box_relative['xmax'])
+        plate_y2 = min(vehicle_crop.shape[0], plate_box_relative['ymax'])
+        
+        expansion = 10
+        plate_y1 = max(0, plate_y1 - expansion)
+        plate_y2 = min(vehicle_crop.shape[0], plate_y2 + expansion)
+        plate_x1 = max(0, plate_x1 - expansion)
+        plate_x2 = min(vehicle_crop.shape[1], plate_x2 + expansion)
+        
+        masked_crop[plate_y1:plate_y2, plate_x1:plate_x2] = 0
+        
+        return masked_crop
+        
+    except Exception as e:
+        logger.error(f"Error excluding plate from vehicle: {e}")
+        return vehicle_crop
+
+def enhanced_color_detection(image_crop, exclude_plate_box=None):
+    try:
+        if exclude_plate_box is not None:
+            image_crop = exclude_plate_from_vehicle(image_crop, exclude_plate_box)
+        
+        hsv = cv2.cvtColor(image_crop, cv2.COLOR_BGR2HSV)
+        hsv_blurred = cv2.GaussianBlur(hsv, (5, 5), 0)
+        
+        non_black_mask = cv2.inRange(hsv[:,:,2], 1, 255)
+        brightness_mask = cv2.inRange(hsv_blurred[:,:,2], 25, 210)
+        saturation_mask = cv2.inRange(hsv_blurred[:,:,1], 15, 255)
+        valid_mask = cv2.bitwise_and(brightness_mask, saturation_mask)
+        valid_mask = cv2.bitwise_and(valid_mask, non_black_mask)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        valid_mask = cv2.morphologyEx(valid_mask, cv2.MORPH_CLOSE, kernel)
+        valid_mask = cv2.morphologyEx(valid_mask, cv2.MORPH_OPEN, kernel)
+        
+        color_ranges = {
+            'white': [[(0, 0, 180), (180, 25, 255)], [(0, 0, 200), (180, 15, 255)]],
+            'black': [[(0, 0, 0), (180, 255, 40)], [(0, 0, 0), (180, 100, 60)]],
+            'silver': [[(0, 0, 100), (180, 20, 200)], [(0, 5, 120), (180, 30, 180)]],
+            'gray': [[(0, 0, 50), (180, 25, 140)], [(0, 10, 60), (180, 40, 160)]],
+            'red': [[(0, 100, 80), (10, 255, 255)], [(170, 100, 80), (180, 255, 255)]],
+            'blue': [[(100, 80, 60), (130, 255, 255)], [(90, 60, 50), (140, 255, 255)]],
+            'green': [[(35, 80, 60), (85, 255, 255)]],
+            'yellow': [[(20, 100, 100), (30, 255, 255)]],
+            'orange': [[(5, 100, 100), (20, 255, 255)]],
+        }
+        
+        total_valid_pixels = cv2.countNonZero(valid_mask)
+        total_pixels = hsv.shape[0] * hsv.shape[1]
+        
+        if total_valid_pixels < total_pixels * 0.1:
+            valid_mask = cv2.inRange(hsv_blurred[:,:,2], 20, 235)
+            valid_mask = cv2.bitwise_and(valid_mask, non_black_mask)
+            total_valid_pixels = cv2.countNonZero(valid_mask)
+        
+        if total_valid_pixels == 0:
+            total_valid_pixels = total_pixels
+            valid_mask = np.ones((hsv.shape[0], hsv.shape[1]), dtype=np.uint8) * 255
+        
+        color_scores = {}
+        
+        for color_name, ranges in color_ranges.items():
+            color_mask = np.zeros((hsv.shape[0], hsv.shape[1]), dtype=np.uint8)
+            
+            for color_range in ranges:
+                range_mask = cv2.inRange(hsv_blurred, np.array(color_range[0]), np.array(color_range[1]))
+                color_mask = cv2.bitwise_or(color_mask, range_mask)
+            
+            final_mask = cv2.bitwise_and(color_mask, valid_mask)
+            pixel_count = cv2.countNonZero(final_mask)
+            
+            if pixel_count > 0:
+                percentage = pixel_count / total_valid_pixels
+                quality_score = 1.0
+                
+                if color_name in ['silver', 'gray']:
+                    masked_brightness = hsv_blurred[:,:,2][final_mask > 0]
+                    if len(masked_brightness) > 10:
+                        brightness_std = np.std(masked_brightness)
+                        quality_score = min(1.0, brightness_std / 30.0)
+                
+                adjusted_score = percentage * quality_score
+                
+                if adjusted_score > 0.008:
+                    color_scores[color_name] = adjusted_score
+        
+        # Cleanup intermediate arrays
+        del hsv, hsv_blurred, valid_mask
+        gc.collect()
+        
+        results = []
+        for color_name, score in color_scores.items():
+            results.append({"score": round(min(score, 0.999), 3), "value": color_name})
+        
+        results.sort(key=lambda x: x["score"], reverse=True)
+        
+        if results and len(results) > 1 and results[0]["score"] > results[1]["score"] * 2:
+            results[0]["score"] = min(0.999, results[0]["score"] * 1.3)
+        
+        return results[:5] if results else [{"score": 0.15, "value": "unknown"}]
+    
+    except Exception as e:
+        logger.error(f"Color detection error: {e}")
+        return [{"score": 0.3, "value": "unknown"}]
+
+def detect_vehicle_orientation(image_crop, vehicle_box):
+    try:
+        height, width = image_crop.shape[:2]
+        aspect_ratio = width / height
+        
+        if aspect_ratio > 2.8:
+            return [{"score": 0.8, "value": "Side"}]
+        elif aspect_ratio > 1.8:
+            return [{"score": 0.6, "value": "Side"}]
+        else:
+            return [{"score": 0.5, "value": "Unknown"}]
+    except Exception as e:
+        logger.error(f"Orientation detection error: {e}")
+        return [{"score": 0.8, "value": "Unknown"}]
+
+def calculate_direction_angle(vehicle_box, image_shape):
+    try:
+        center_x = (vehicle_box["xmin"] + vehicle_box["xmax"]) / 2
+        center_y = (vehicle_box["ymin"] + vehicle_box["ymax"]) / 2
+        
+        img_center_x = image_shape[1] / 2
+        img_center_y = image_shape[0] / 2
+        
+        dx = center_x - img_center_x
+        dy = center_y - img_center_y
+        
+        angle = np.arctan2(dy, dx) * 180 / np.pi
+        if angle < 0:
+            angle += 360
+        
+        distance = np.sqrt(dx**2 + dy**2)
+        max_distance = np.sqrt((image_shape[1]/2)**2 + (image_shape[0]/2)**2)
+        confidence = min(0.9, max(0.3, distance / max_distance))
+        
+        return int(angle), round(confidence, 3)
+    except Exception as e:
+        logger.error(f"Direction angle error: {e}")
+        return 0, 0.5
+
+def get_vehicle_type(class_id):
+    vehicle_types = {2: "Car", 3: "Motorcycle", 5: "Bus", 7: "Truck"}
+    return vehicle_types.get(class_id, "Vehicle")
+
+def extract_brand_only(class_name):
+    try:
+        known_brands = {
+            'audi', 'bmw', 'mercedes', 'toyota', 'honda', 'nissan',
+            'ford', 'chevrolet', 'hyundai', 'kia', 'mazda',
+            'lexus', 'tesla', 'volvo', 'volkswagen', 'hummer'
+        }
+        
+        clean_name = str(class_name).lower().strip()
+        words = clean_name.split()
+        
+        if not words:
+            return "Unknown"
+        
+        if words[0] in known_brands:
+            return words[0].title()
+        
+        return words[0].title()
+        
+    except Exception as e:
+        logger.error(f"Brand extraction error: {e}")
+        return "Unknown"
+
+def detect_brand_local(vehicle_crop):
+    all_brands = {}
+    local_models = get_local_models()
+    
+    if 'logo' in local_models:
+        try:
+            results = local_models['logo'](vehicle_crop, verbose=False)
+            for result in results:
+                boxes = result.boxes
+                if boxes is not None:
+                    for box in boxes:
+                        class_id = int(box.cls[0])
+                        confidence = float(box.conf[0])
+                        class_name = local_models['logo'].names[class_id]
+                        
+                        if confidence > 0.3:
+                            brand = class_name.replace('_', ' ').title()
+                            boosted = min(0.99, confidence * 1.1)
+                            
+                            if brand not in all_brands or boosted > all_brands[brand]:
+                                all_brands[brand] = boosted
+        except Exception as e:
+            logger.error(f"Local logo error: {e}")
+    
+    if all_brands:
+        results = []
+        for brand, confidence in all_brands.items():
+            results.append({"make": brand, "model": "", "score": round(confidence, 3)})
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results[:3]
+    
+    return []
+
+def detect_brand_api(vehicle_crop):
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
+            temp_path = temp_file.name
+            cv2.imwrite(temp_path, vehicle_crop)
+        
+        all_brands = {}
+        api_key = "cWAtA64nVnDxwtkX5XDI"
+        
+        models = [
+            ("Car Logo", "https://detect.roboflow.com/car-logo-detection-ggm8y/1", 1.1),
+            ("Car Make", "https://detect.roboflow.com/car-make-detection/11", 1.0),
+            ("Stanford Cars", "https://detect.roboflow.com/stanford_car/3", 1.0)
+        ]
+        
+        session = create_session_with_retries()
+        
+        for model_name, url, boost in models:
+            try:
+                with open(temp_path, 'rb') as image_file:
+                    response = session.post(
+                        f"{url}?api_key={api_key}",
+                        files={"file": image_file},
+                        timeout=8
+                    )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    if 'predictions' in result and result['predictions']:
+                        for pred in result['predictions']:
+                            class_name = pred.get('class', 'Unknown')
+                            confidence = float(pred.get('confidence', 0.0))
+                            
+                            if confidence > 0.3:
+                                if model_name == "Stanford Cars":
+                                    brand = extract_brand_only(class_name)
+                                else:
+                                    brand = class_name.replace('_', ' ').title()
+                                
+                                adjusted = min(0.99, confidence * boost)
+                                
+                                if brand not in all_brands or adjusted > all_brands[brand]:
+                                    all_brands[brand] = adjusted
+                    
+            except requests.Timeout:
+                logger.warning(f"{model_name} request timed out")
+                continue
+            except Exception as e:
+                logger.error(f"{model_name}: {str(e)[:100]}")
+                continue
+        
+        session.close()
+        
+        if all_brands:
+            results = []
+            for brand, confidence in all_brands.items():
+                results.append({"make": brand, "model": "", "score": round(confidence, 3)})
+            
+            results.sort(key=lambda x: x['score'], reverse=True)
+            return results[:3]
+        
+        return [{"make": "Unknown", "model": "", "score": 0.0}]
+        
+    except Exception as e:
+        logger.error(f"API brand detection failed: {e}")
+        return [{"make": "Unknown", "model": "", "score": 0.0}]
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+
+def detect_brand_roboflow(vehicle_crop):
+    try:
+        local_models = get_local_models()
+        if local_models:
+            local_result = detect_brand_local(vehicle_crop)
+            if local_result and local_result[0]["score"] > 0.0:
+                return local_result
+        
+        return detect_brand_api(vehicle_crop)
+    except Exception as e:
+        logger.error(f"Brand detection failed: {e}")
+        return [{"make": "Unknown", "model": "", "score": 0.0}]
+
+def enhance_plate_region(image):
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        denoised = cv2.bilateralFilter(gray, 11, 17, 17)
+        equalized = cv2.equalizeHist(denoised)
+        thresh = cv2.adaptiveThreshold(equalized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                       cv2.THRESH_BINARY, 11, 2)
+        return thresh
+    except Exception as e:
+        logger.error(f"Plate enhancement error: {e}")
+        return image
+
+def detect_car_and_plate(image_path):
+    """Main detection function with improved memory management"""
+    with managed_cv2_image(image_path) as image:
+        try:
+            if image is None:
+                logger.error(f"Failed to load image: {image_path}")
+                return []
+            
+            logger.info(f"Image loaded: {image.shape[1]}x{image.shape[0]} pixels")
+            
+            yolo_model = get_yolo_model()
+            ocr_reader = get_ocr_reader()
+            
+            logger.info("Running YOLO vehicle detection...")
+            results = yolo_model(image, verbose=False)
+            detections = []
+            
+            vehicles_found = 0
+            for result in results:
+                boxes = result.boxes
+                if boxes is not None:
+                    vehicles_found = len([b for b in boxes if int(b.cls[0]) in [2, 3, 5, 7]])
+            
+            logger.info(f"Found {vehicles_found} vehicle(s) in image")
+            
+            for result in results:
+                boxes = result.boxes
+                if boxes is not None:
+                    for box in boxes:
+                        class_id = int(box.cls[0])
+                        if class_id in [2, 3, 5, 7]:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            confidence = float(box.conf[0])
+                            
+                            logger.info(f"Processing Vehicle: {get_vehicle_type(class_id)}, Confidence: {confidence:.3f}")
+                            
+                            vehicle_crop = image[y1:y2, x1:x2].copy()
+                            
+                            if vehicle_crop.size == 0:
+                                continue
+                            
+                            vehicle_box = {"xmax": x2, "xmin": x1, "ymax": y2, "ymin": y1}
+                            
+                            logger.info("Plate Detection")
+                            plate_box_relative = None
+                            plate_data = None
+                            
+                            try:
+                                ocr_results = ocr_reader.readtext(vehicle_crop)
+                                
+                                if not ocr_results:
+                                    enhanced = enhance_plate_region(vehicle_crop)
+                                    ocr_results = ocr_reader.readtext(enhanced)
+                                    del enhanced
+                                
+                                if ocr_results:
+                                    plate_candidates = []
+                                    best_bbox = None
+                                    
+                                    for bbox, text, conf in ocr_results:
+                                        clean_text = clean_plate_text(text)
+                                        if len(clean_text) >= 3 and conf > 0.25:
+                                            plate_candidates.append({"score": conf, "value": clean_text.lower()})
+                                            if best_bbox is None or conf > best_bbox[2]:
+                                                best_bbox = (bbox, text, conf)
+                                    
+                                    if plate_candidates:
+                                        plate_candidates.sort(key=lambda x: x["score"], reverse=True)
+                                        
+                                        all_plate_values = []
+                                        for candidate in plate_candidates:
+                                            all_plate_values.append(candidate)
+                                        
+                                        if best_bbox is not None:
+                                            bbox = best_bbox[0]
+                                            plate_x1 = int(min([point[0] for point in bbox]))
+                                            plate_y1 = int(min([point[1] for point in bbox]))
+                                            plate_x2 = int(max([point[0] for point in bbox]))
+                                            plate_y2 = int(max([point[1] for point in bbox]))
+                                            
+                                            plate_box_relative = {
+                                                "xmin": plate_x1,
+                                                "ymin": plate_y1,
+                                                "xmax": plate_x2,
+                                                "ymax": plate_y2
+                                            }
+                                        
+                                        avg_confidence = np.mean([candidate["score"] for candidate in plate_candidates])
+                                        plate_score = min(0.95, avg_confidence + 0.05)
+                                        
+                                        plate_data = {
+                                            "box": {
+                                                "xmax": x1 + plate_box_relative["xmax"] if plate_box_relative else x2,
+                                                "xmin": x1 + plate_box_relative["xmin"] if plate_box_relative else x1,
+                                                "ymax": y1 + plate_box_relative["ymax"] if plate_box_relative else y2,
+                                                "ymin": y1 + plate_box_relative["ymin"] if plate_box_relative else y1
+                                            },
+                                            "type": "Plate",
+                                            "props": {
+                                                "plate": all_plate_values,
+                                                "region": [{"score": 0.9, "value": "ae-du"}]
+                                            },
+                                            "score": round(plate_score, 3)
+                                        }
+                            except Exception as ocr_error:
+                                logger.error(f"OCR failed: {ocr_error}")
+                            
+                            direction_angle, direction_confidence = calculate_direction_angle(vehicle_box, image.shape)
+                            vehicle_orientation = detect_vehicle_orientation(vehicle_crop, vehicle_box)
+                            vehicle_make_model = detect_brand_roboflow(vehicle_crop)
+                            vehicle_colors = enhanced_color_detection(vehicle_crop, exclude_plate_box=plate_box_relative)
+                            
+                            detection = {
+                                "plate": plate_data,
+                                "vehicle": {
+                                    "box": vehicle_box,
+                                    "type": get_vehicle_type(class_id),
+                                    "props": {
+                                        "color": vehicle_colors,
+                                        "make_model": vehicle_make_model,
+                                        "orientation": vehicle_orientation
+                                    },
+                                    "score": confidence
+                                },
+                                "direction": direction_angle,
+                                "direction_score": direction_confidence
+                            }
+                            
+                            detections.append(detection)
+                            logger.info("Vehicle detection complete")
+                            
+                            del vehicle_crop
+                            gc.collect()
+            
+            if detections:
+                detections.sort(key=lambda x: (
+                    (x["vehicle"]["box"]["xmax"] - x["vehicle"]["box"]["xmin"]) * 
+                    (x["vehicle"]["box"]["ymax"] - x["vehicle"]["box"]["ymin"])
+                ), reverse=True)
+                
+                logger.info(f"Detection complete. Returning {len(detections)} vehicle(s)")
+                return [detections[0]]
+            
+            logger.warning("No vehicles detected in image")
+            return []
+            
+        except Exception as e:
+            logger.error(f"FATAL ERROR in detect_car_and_plate: {e}", exc_info=True)
+            return []
+        finally:
+            gc.collect()
+
+if __name__ == "__main__":
+    result = detect_car_and_plate("data/test_car.jpg")
+    print("\nDetection Result")
+    print(json.dumps(result, indent=2))
